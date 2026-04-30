@@ -21,7 +21,6 @@ async function startServer() {
       const { message, history } = req.body;
       let API_KEY = process.env.GEMINI_API_KEY;
       
-      // Clean up the key in case it was entered with quotes or spaces in the Secrets panel
       if (API_KEY) {
         API_KEY = API_KEY.trim().replace(/^["']|["']$/g, '');
       }
@@ -37,52 +36,95 @@ Formato: Interrogatorio Socrático. Breve resumen técnico, Análisis de Incongr
 Rigor: Exige fuentes ante anacronismos (Alerta de Corrupción de Datos).
 Evaluación: Indica "Causalidad procesada. Nivel óptimo" si lo hacen bien, o "Datos insuficientes" si es vago.`;
 
-      const ai = new GoogleGenAI({ apiKey: API_KEY });
+      const ai = new GoogleGenAI({
+        apiKey: API_KEY,
+      });
 
-      // Format history
-      const formattedHistory = history ? history.map((msg: any) => ({
-        role: msg.role === 'bot' ? 'model' : 'user',
+      // Format history for the new SDK, ensuring it starts with 'user'
+      let contents = history ? history.map((msg: any) => ({
+        role: msg.role === 'bot' || msg.role === 'model' ? 'model' : 'user',
         parts: [{ text: msg.parts[0].text }]
       })) : [];
 
-      const contents = [...formattedHistory];
+      // Filter out leading 'model' messages if they exist (Gemini usually wants to start with 'user')
+      while (contents.length > 0 && contents[0].role === 'model') {
+        contents.shift();
+      }
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-lite-preview",
-        contents: contents,
-        config: {
-          systemInstruction: SYSTEM_PROMPT,
-          temperature: 0.3,
-          maxOutputTokens: 250,
-          thinkingConfig: {
-            thinkingLevel: ThinkingLevel.LOW,
+      // If for some reason we have no user message yet, or history was empty/filtered out
+      // (This shouldn't happen based on App.tsx logic)
+      if (contents.length === 0) {
+        contents = [{ role: 'user', parts: [{ text: message || "hola" }] }];
+      }
+
+      // Include system prompt as first message if no history, or separate if supported
+      // Use config according to user snippet
+      const config = {
+        systemInstruction: SYSTEM_PROMPT,
+        temperature: 0.3,
+        maxOutputTokens: 250,
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.LOW,
+        },
+        safetySettings: [
+          {
+            category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
           },
-          safetySettings: [
-            {
-              category: HarmCategory.HARM_CATEGORY_HARASSMENT,
-              threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-            },
-            {
-              category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-              threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-            },
-            {
-              category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-              threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-            },
-          ],
-          tools: [
-            {
-              googleSearch: {}
-            }
-          ]
-        }
+          {
+            category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+          },
+          {
+            category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+          },
+        ],
+        tools: [
+          {
+            googleSearch: {}
+          }
+        ]
+      };
+
+      const model = "gemini-3.1-flash-lite-preview";
+      
+      console.log(`Enviando petición a Gemini (${model})...`);
+      const response = await ai.models.generateContent({
+        model: model,
+        contents: contents,
+        config: config
       });
 
-      return res.status(200).json({ reply: response.text });
-    } catch (error) {
+      console.log("Respuesta recibida de Gemini");
+
+      let reply = "";
+      if ((response as any).text) {
+        reply = typeof (response as any).text === 'function' ? (response as any).text() : (response as any).text;
+      } else if (response.candidates && response.candidates[0]?.content?.parts?.[0]?.text) {
+        reply = response.candidates[0].content.parts[0].text;
+      }
+
+      if (!reply) {
+        console.error("No se pudo extraer texto de la respuesta:", JSON.stringify(response));
+        throw new Error("La IA no devolvió contenido de texto.");
+      }
+
+      return res.status(200).json({ reply: reply });
+    } catch (error: any) {
       console.error("Error en API:", error);
-      return res.status(500).json({ error: 'Error de comunicación con Gemini' });
+      let errorMessage = 'Error de comunicación con Gemini';
+      
+      // If it's a quota or auth error, be specific
+      if (error.message && error.message.includes("quota")) {
+        errorMessage = "Cuota excedida. Por favor, inténtalo de nuevo en unos segundos.";
+      } else if (error.message && error.message.includes("key not valid")) {
+        errorMessage = "API Key inválida. Por favor, verifica la configuración.";
+      } else if (error.message) {
+        errorMessage = error.message;
+      }
+
+      return res.status(500).json({ error: errorMessage });
     }
   });
 
